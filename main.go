@@ -1,9 +1,11 @@
 package main
 
 import (
-	"bytes"
 	"crypto/md5"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"net"
@@ -13,14 +15,22 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 
+	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
+	"github.com/kennygrant/sanitize"
 	"gopkg.in/alecthomas/kingpin.v2"
 )
 
+const (
+	MsgDontSendFile = "Hash recieved for song, no need to send full file."
+	MsgSendFullFile = "Song hash not found, send full base64 encoded file."
+	MsgSongQueued   = "Song successfully added to queue."
+)
+
 type serverStruct struct {
-	port   *int
-	weight *int
+	port *int
 }
 
 type clientStruct struct {
@@ -31,14 +41,19 @@ type clientStruct struct {
 }
 
 type songHolder struct {
-	selfSubmitted bool
-	fileName      string
-	fileURL       string
-	fileSearch    string
+	ipAddr     string
+	fileName   string
+	fileURL    string
+	fileSearch string
+}
+
+type SongData struct {
+	FileName string `json:"filename"`
+	Data     string `json:"data"`
 }
 
 var songQueue []songHolder
-var hashHolder map[string]string
+var hashHolder = make(map[string]string)
 
 var downloadFolder, _ = filepath.Abs("./serverSongs")
 
@@ -48,15 +63,14 @@ func main() {
 	serverMode := app.Command("server", "Start qli in server mode.")
 	server := serverStruct{
 		serverMode.Arg("port", "Port to run qli server on.").Default("3005").Int(),
-		serverMode.Arg("ratio", "How many songs you can play for each song any other user can play").Default("1").Int(),
 	}
 
 	clientMode := app.Command("client", "Start qli in client mode")
 	client := clientStruct{
-		clientMode.Arg("server", "qli server IP address and port number").Required().URL(),
+		clientMode.Arg("server", "qli server IP address and port number.").Required().URL(),
 		clientMode.Flag("file", "Play an mp3 file on the server.").Short('f').File(),
 		clientMode.Flag("url", "Play music from a youtube or spotify url.").Short('u').URL(),
-		clientMode.Flag("search", "Search for a song on spotify and select one to be played").Short('s').String(),
+		clientMode.Flag("search", "Search for a song on spotify and select one to be played.").Short('s').String(),
 	}
 
 	switch kingpin.MustParse(app.Parse(os.Args[1:])) {
@@ -72,7 +86,7 @@ func main() {
 		} else if *client.songSearch != "" {
 			queueSearch(client)
 		} else {
-			println("Please enter a file, url, or song to search, in order to queuemmand a song")
+			fmt.Println("Please enter a file, url, or song to search, in order to queuemmand a song")
 		}
 	}
 }
@@ -83,26 +97,62 @@ func panicIf(err error) {
 	}
 }
 
+func toJSON(data interface{}) string {
+	jsonString, err := json.Marshal(data)
+	panicIf(err)
+	return string(jsonString)
+}
+
 //*******************
 // Client code here
 //*******************
 
 func queueFile(client clientStruct) {
-	server := "http://" + (**client.serverURL).Host
-
-	println("Reading file")
-	dat, err := ioutil.ReadFile((*client.songFile).Name())
+	songPath := (*client.songFile).Name()
+	songName := filepath.Base((*client.songFile).Name())
+	dat, err := ioutil.ReadFile(songPath)
 	panicIf(err)
 
-	println("Hashing file")
 	hash := md5.Sum(dat)
 
-	println("Checking if file is stored on qli server")
-	hashReader := bytes.NewReader(hash[:])
-	resp, err := http.Post(server, "data", hashReader)
-	panicIf(err)
+	var hashResponse string
+	sendData(client, "checkHash", string(hash[:]), &hashResponse)
 
-	println(resp)
+	if hashResponse != MsgSendFullFile {
+		fmt.Println(hashResponse)
+		return
+	}
+
+	encodedData := base64.StdEncoding.EncodeToString(dat)
+	song := SongData{
+		FileName: songName,
+		Data:     encodedData,
+	}
+	songJSON := toJSON(song)
+
+	var uploadResponse string
+	fmt.Println("Sending song to server")
+	sendData(client, "uploadFile", songJSON, &uploadResponse)
+	fmt.Println(uploadResponse)
+}
+
+func sendData(client clientStruct, path string, jsonString string, fillResult interface{}) {
+	server := "http://" + (**client.serverURL).Host + "/"
+	dataReader := strings.NewReader(jsonString)
+
+	request, err := http.NewRequest("POST", server+path, dataReader)
+	panicIf(err)
+	request.Header.Set("Content-Type", "application/json")
+	defer request.Body.Close()
+
+	requestClient := &http.Client{}
+	resp, err := requestClient.Do(request)
+	panicIf(err)
+	defer resp.Body.Close()
+
+	err = json.NewDecoder(resp.Body).Decode(fillResult)
+	panicIf(err)
+	return
 }
 
 func queueURL(client clientStruct) {
@@ -125,18 +175,18 @@ func startServer(server serverStruct) {
 	log.Println("Tell your friends to send requests to " + ipAddr + ":" + strconv.Itoa(*server.port))
 	hashExistingFiles()
 
-	router := mux.NewRouter()
-	router.HandleFunc("/checkHash", checkHash).
+	r := mux.NewRouter()
+	r.HandleFunc("/checkHash", checkHash).
 		Methods("POST").
 		HeadersRegexp("Content-Type", "application/(text|json)")
-	router.HandleFunc("/uploadFile", uploadFile).
+	r.HandleFunc("/uploadFile", uploadFile).
 		Methods("POST").
 		HeadersRegexp("Content-Type", "application/(text|json)")
 
-	router.NotFoundHandler = http.HandlerFunc(errorPage)
+	r.NotFoundHandler = http.HandlerFunc(errorPage)
 
 	portString := strconv.Itoa(*server.port)
-	http.ListenAndServe(":"+portString, router)
+	http.ListenAndServe(":"+portString, handlers.RecoveryHandler(handlers.PrintRecoveryStack(true))(r))
 }
 
 func hashExistingFiles() {
@@ -146,14 +196,21 @@ func hashExistingFiles() {
 		return
 	}
 	files, _ := ioutil.ReadDir(downloadFolder)
+
+	totalMp3s := 0
 	for _, file := range files {
-		dat, err := ioutil.ReadFile(file.Name())
-		panicIf(err)
-		hash := md5.Sum(dat)
-		hashHolder[string(hash[:])] = file.Name()
+		songName := file.Name()
+		if songName[len(songName)-4:] == ".mp3" {
+			fmt.Println("Hashing: " + songName)
+			totalMp3s++
+			dat, err := ioutil.ReadFile(downloadFolder + "/" + songName)
+			panicIf(err)
+			hash := md5.Sum(dat)
+			hashHolder[string(hash[:])] = songName
+		}
 	}
 
-	log.Println("Hashed existing serverSongs folder contents, which was " + strconv.Itoa(len(files)) + " total songs")
+	log.Println("Hashed existing serverSongs folder contents, which was " + strconv.Itoa(totalMp3s) + " total .mp3 files")
 }
 
 func checkHash(w http.ResponseWriter, r *http.Request) {
@@ -161,21 +218,58 @@ func checkHash(w http.ResponseWriter, r *http.Request) {
 	panicIf(err)
 
 	var msg string
-	songName, exists := hashHolder[string(sentHash)]
+	_, exists := hashHolder[string(sentHash)]
 	if exists {
-		msg = ("Hash recieved for song \"" + songName + "\", no need to send full file.")
+		//TODO: queuesong
+		msg = MsgDontSendFile
 		w.WriteHeader(200)
 	} else {
-		msg = ("Song hash not found, send full base64 encoded file.")
+		msg = MsgSendFullFile
 		w.WriteHeader(404)
 	}
 
 	log.Println(msg + " (ip: " + clientAddress(r) + ")")
-	w.Write([]byte(msg))
+	w.Write([]byte(toJSON(msg)))
 }
 
 func uploadFile(w http.ResponseWriter, r *http.Request) {
-	w.Write([]byte("Gorilla!\n"))
+	defer r.Body.Close()
+
+	var song SongData
+	err := json.NewDecoder(r.Body).Decode(&song)
+	panicIf(err)
+	fmt.Println(song.FileName)
+
+	cleanFileName := sanitize.BaseName(song.FileName)
+	decodedRawData, err := base64.StdEncoding.DecodeString(song.Data)
+	panicIf(err)
+	hash := md5.Sum(decodedRawData)
+	songName, exists := hashHolder[string(hash[:])]
+
+	if exists {
+		msg := (`Recieved raw data for "` + cleanFileName + `", aka "` + songName + `". Request rejected, send hashes before full song data.`)
+		w.WriteHeader(403)
+		log.Println(msg + " (ip: " + clientAddress(r) + ")")
+		w.Write([]byte(msg))
+		return
+	}
+	file, err := os.Create(downloadFolder + "/" + cleanFileName + ".mp3")
+	panicIf(err)
+	defer file.Close()
+	_, err = file.Write(decodedRawData)
+	panicIf(err)
+	file.Sync()
+
+	queueSong(cleanFileName, string(hash[:]), songHolder{clientAddress(r), cleanFileName, "", ""})
+
+	w.WriteHeader(200)
+	log.Println(`Song "` + cleanFileName + `" successfully added to queue. (ip: ` + clientAddress(r) + ")")
+	w.Write([]byte(toJSON(MsgSongQueued)))
+}
+
+func queueSong(name string, hash string, song songHolder) {
+	hashHolder[hash] = name
+	songQueue = append(songQueue, song)
 }
 
 func serverAddress() (string, error) {
@@ -205,6 +299,6 @@ func clientAddress(r *http.Request) string {
 }
 
 func errorPage(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json") // send content in JSON
-	w.Write([]byte(`{"status": "nonexistent page"}` + "\n"))
+	w.WriteHeader(403)
+	w.Write([]byte("Page access forbidden with current credentials."))
 }

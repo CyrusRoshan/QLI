@@ -21,9 +21,27 @@
 			"Rev": "a8d44e7d8e4d532b6a27a02dd82abb31cc1b01bd"
 		},
 		{
+			"ImportPath": "github.com/gorilla/handlers",
+			"Comment": "v1.1-6-g66e6c6f",
+			"Rev": "66e6c6f01d8da976ee113437745ca029c2b585a6"
+		},
+		{
 			"ImportPath": "github.com/gorilla/mux",
 			"Comment": "v1.1-7-g9c19ed5",
 			"Rev": "9c19ed558d5df4da88e2ade9c8940d742aef0e7e"
+		},
+		{
+			"ImportPath": "github.com/kennygrant/sanitize",
+			"Comment": "v1.0",
+			"Rev": "ce9fd1f6ce32afaa38b51feea32320fc8875e8e4"
+		},
+		{
+			"ImportPath": "golang.org/x/net/html",
+			"Rev": "0c607074acd38c5f23d1344dfe74c977464d1257"
+		},
+		{
+			"ImportPath": "golang.org/x/net/html/atom",
+			"Rev": "0c607074acd38c5f23d1344dfe74c977464d1257"
 		},
 		{
 			"ImportPath": "gopkg.in/alecthomas/kingpin.v2",
