@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -27,6 +28,11 @@ const (
 	MsgDontSendFile = "Hash recieved for song, no need to send full file."
 	MsgSendFullFile = "Song hash not found, send full base64 encoded file."
 	MsgSongQueued   = "Song successfully added to queue."
+	MsgOnlyMP3      = "File rejected. Please only send MP3 files."
+)
+
+var (
+	ErrNoSongsLeft = errors.New("There are no songs left in queue.")
 )
 
 type serverStruct struct {
@@ -40,19 +46,26 @@ type clientStruct struct {
 	songSearch *string
 }
 
-type songHolder struct {
-	ipAddr     string
-	fileName   string
-	fileURL    string
-	fileSearch string
+type SongHolder struct {
+	IpAddr     string `json:"ipAddr"`
+	FileName   string `json:"fileName"`
+	FileHash   string `json:"fileHash"`
+	FileURL    string `json:"fileURL"`
+	FileSearch string `json:"fileSearch"`
 }
 
 type SongData struct {
-	FileName string `json:"filename"`
+	FileName string `json:"fileName"`
 	Data     string `json:"data"`
 }
 
-var songQueue []songHolder
+type UserData struct {
+	Played bool         `json:"played"`
+	Songs  []SongHolder `json:"songs"`
+}
+
+var currentlyPlaying = false
+var songQueue = make(map[string]*UserData)
 var hashHolder = make(map[string]string)
 
 var downloadFolder, _ = filepath.Abs("./serverSongs")
@@ -182,6 +195,8 @@ func startServer(server serverStruct) {
 	r.HandleFunc("/uploadFile", uploadFile).
 		Methods("POST").
 		HeadersRegexp("Content-Type", "application/(text|json)")
+	r.HandleFunc("/getQueue", getQueue).
+		Methods("GET")
 
 	r.NotFoundHandler = http.HandlerFunc(errorPage)
 
@@ -201,7 +216,7 @@ func hashExistingFiles() {
 	for _, file := range files {
 		songName := file.Name()
 		if songName[len(songName)-4:] == ".mp3" {
-			fmt.Println("Hashing: " + songName)
+			log.Println("Hashing: " + songName)
 			totalMp3s++
 			dat, err := ioutil.ReadFile(downloadFolder + "/" + songName)
 			panicIf(err)
@@ -218,11 +233,11 @@ func checkHash(w http.ResponseWriter, r *http.Request) {
 	panicIf(err)
 
 	var msg string
-	_, exists := hashHolder[string(sentHash)]
+	songName, exists := hashHolder[string(sentHash)]
 	if exists {
-		//TODO: queuesong
 		msg = MsgDontSendFile
 		w.WriteHeader(200)
+		go queueSong(SongHolder{clientAddress(r), songName, string(sentHash), "", ""})
 	} else {
 		msg = MsgSendFullFile
 		w.WriteHeader(404)
@@ -238,16 +253,26 @@ func uploadFile(w http.ResponseWriter, r *http.Request) {
 	var song SongData
 	err := json.NewDecoder(r.Body).Decode(&song)
 	panicIf(err)
-	fmt.Println(song.FileName)
 
-	cleanFileName := sanitize.BaseName(song.FileName)
+	name := song.FileName[:len(song.FileName)-4]
+	extension := song.FileName[len(song.FileName)-4:]
+	cleanFileName := sanitize.BaseName(name)
+
+	log.Println("Recieved request to queue " + name)
+	if extension != ".mp3" {
+		w.WriteHeader(200)
+		log.Println(name + " rejected. Not an .mp3 file. (ip: " + clientAddress(r) + ")")
+		w.Write([]byte(toJSON(MsgOnlyMP3)))
+		return
+	}
+
 	decodedRawData, err := base64.StdEncoding.DecodeString(song.Data)
 	panicIf(err)
 	hash := md5.Sum(decodedRawData)
 	songName, exists := hashHolder[string(hash[:])]
 
 	if exists {
-		msg := (`Recieved raw data for "` + cleanFileName + `", aka "` + songName + `". Request rejected, send hashes before full song data.`)
+		msg := (`Recieved raw data for "` + name + `", aka "` + songName + `". Request rejected, send hashes before full song data.`)
 		w.WriteHeader(403)
 		log.Println(msg + " (ip: " + clientAddress(r) + ")")
 		w.Write([]byte(msg))
@@ -260,16 +285,76 @@ func uploadFile(w http.ResponseWriter, r *http.Request) {
 	panicIf(err)
 	file.Sync()
 
-	queueSong(cleanFileName, string(hash[:]), songHolder{clientAddress(r), cleanFileName, "", ""})
+	queueSong(SongHolder{clientAddress(r), cleanFileName, string(hash[:]), "", ""})
 
 	w.WriteHeader(200)
-	log.Println(`Song "` + cleanFileName + `" successfully added to queue. (ip: ` + clientAddress(r) + ")")
 	w.Write([]byte(toJSON(MsgSongQueued)))
 }
 
-func queueSong(name string, hash string, song songHolder) {
-	hashHolder[hash] = name
-	songQueue = append(songQueue, song)
+func getQueue(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	w.Write([]byte(toJSON(songQueue)))
+}
+
+func queueSong(song SongHolder) {
+	if song.FileHash != "" {
+		hashHolder[song.FileHash] = song.FileName
+	}
+
+	_, userExists := songQueue[song.IpAddr]
+	if !userExists {
+		songQueue[song.IpAddr] = &UserData{false, nil}
+	}
+
+	songQueue[song.IpAddr].Songs = append(songQueue[song.IpAddr].Songs, song)
+	log.Println(song.FileName + " successfully added to queue. (ip: " + song.IpAddr + ")")
+	if !currentlyPlaying {
+		playSongs()
+	}
+}
+
+func playSongs() {
+	currentlyPlaying = true
+	nextSong, err := popQueue()
+	if err != nil {
+		log.Println(err)
+		currentlyPlaying = false
+		return
+	}
+	if nextSong.FileHash != "" {
+		log.Println("CURRENTLY PLAYING " + nextSong.FileName)
+		playSong := exec.Command("afplay", downloadFolder+"/"+nextSong.FileName)
+		err := playSong.Run()
+		if err != nil {
+			log.Println(err)
+		}
+		log.Println("DONE PLAYING " + nextSong.FileName)
+	}
+	playSongs()
+}
+
+func popQueue() (SongHolder, error) {
+	// pretty ugly, but it's like 10 people max and I'm lazy
+	var songsExist bool
+	for user, _ := range songQueue {
+		if !songQueue[user].Played && len(songQueue[user].Songs) > 0 {
+			songQueue[user].Played = true
+			poppedSong := songQueue[user].Songs[0]
+			songQueue[user].Songs = songQueue[user].Songs[1:]
+			return poppedSong, nil
+		}
+		if len(songQueue[user].Songs) > 0 {
+			songsExist = true
+		}
+	}
+	for user, _ := range songQueue {
+		songQueue[user].Played = false
+	}
+	if songsExist {
+		return popQueue()
+	}
+	return SongHolder{}, ErrNoSongsLeft
 }
 
 func serverAddress() (string, error) {
