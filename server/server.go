@@ -1,11 +1,13 @@
 package server
 
 import (
+	"bufio"
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
@@ -14,11 +16,30 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/cyrusroshan/qli/utils"
+	"github.com/fatih/color"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 	"github.com/kennygrant/sanitize"
+)
+
+var (
+	songPlayer       *exec.Cmd
+	songPlayerInput  io.WriteCloser
+	CurrentlyPlaying = false
+	SongQueue        = make(map[string]*UserData)
+	HashHolder       = make(map[string]string)
+
+	DownloadFolder, _ = filepath.Abs("./serverSongs")
+	RawMp3Folder, _   = filepath.Abs("./serverSongs/rawmp3")
+	YoutubeFolder, _  = filepath.Abs("./serverSongs/youtube")
+	SpotifyFolder, _  = filepath.Abs("./serverSongs/spotify")
+
+	infoMsg    = color.New(color.FgYellow).Add(color.Bold)
+	errorMsg   = color.New(color.FgRed).Add(color.Bold)
+	successMsg = color.New(color.FgGreen).Add(color.Bold)
 )
 
 const (
@@ -28,25 +49,28 @@ const (
 	MsgOnlyMP3      = "File rejected. Please only send MP3 files."
 )
 
+const (
+	RAWMP3 = iota
+	YOUTUBE
+	SPOTIFY
+	SEARCH
+)
+
 var (
 	ErrNoSongsLeft = errors.New("There are no songs left in queue.")
 )
-
-var CurrentlyPlaying = false
-var SongQueue = make(map[string]*UserData)
-var HashHolder = make(map[string]string)
-var DownloadFolder, _ = filepath.Abs("./serverSongs")
 
 type ServerStruct struct {
 	Port *int
 }
 
 type SongHolder struct {
-	IpAddr     string `json:"ipAddr"`
-	FileName   string `json:"fileName"`
-	FileHash   string `json:"fileHash"`
-	FileURL    string `json:"fileURL"`
-	FileSearch string `json:"fileSearch"`
+	IpAddr   string `json:"ipAddr"`
+	Name     string `json:"fileName"`
+	Type     int    `json:"songType"`
+	FileHash string `json:"fileHash"`
+	URL      string `json:"fileURL"`
+	Search   string `json:"fileSearch"`
 }
 
 type SongData struct {
@@ -62,10 +86,21 @@ type UserData struct {
 func StartServer(server ServerStruct) {
 	log.Println("Starting qli server")
 
+	utils.MakeDirIfNotExist(DownloadFolder)
+	utils.MakeDirIfNotExist(RawMp3Folder)
+	utils.MakeDirIfNotExist(YoutubeFolder)
+	utils.MakeDirIfNotExist(SpotifyFolder)
+
+	HashExistingFiles(RawMp3Folder)
+	HashExistingFiles(YoutubeFolder)
+	HashExistingFiles(SpotifyFolder)
+
 	ipAddr, err := ServerAddress()
 	utils.PanicIf(err)
-	log.Println("Tell your friends to send requests to " + ipAddr + ":" + strconv.Itoa(*server.Port))
-	HashExistingFiles(DownloadFolder)
+	infoMsg.Println("Tell your friends to send requests to " + ipAddr + ":" + strconv.Itoa(*server.Port))
+
+	utils.PanicIf(err)
+	go HandleInput()
 
 	r := mux.NewRouter()
 	r.HandleFunc("/checkHash", CheckHash).
@@ -84,11 +119,7 @@ func StartServer(server ServerStruct) {
 }
 
 func HashExistingFiles(folder string) {
-	if _, err := os.Stat(folder); os.IsNotExist(err) {
-		err := os.Mkdir(folder, 0777)
-		utils.PanicIf(err)
-		return
-	}
+	utils.MakeDirIfNotExist(folder)
 	files, _ := ioutil.ReadDir(folder)
 
 	totalMp3s := 0
@@ -100,11 +131,12 @@ func HashExistingFiles(folder string) {
 			dat, err := ioutil.ReadFile(folder + "/" + songName)
 			utils.PanicIf(err)
 			hash := md5.Sum(dat)
-			HashHolder[string(hash[:])] = songName
+			HashHolder[string(hash[:])] = songName[:len(songName)-4]
 		}
 	}
 
-	log.Println("Hashed existing serverSongs folder contents, which was " + strconv.Itoa(totalMp3s) + " total .mp3 files")
+	folderName := strings.Split(folder, "/")
+	log.Println("Hashed existing " + folderName[len(folderName)-1] + " files, which was " + strconv.Itoa(totalMp3s) + " total .mp3 files")
 }
 
 func CheckHash(w http.ResponseWriter, r *http.Request) {
@@ -116,7 +148,14 @@ func CheckHash(w http.ResponseWriter, r *http.Request) {
 	if exists {
 		msg = MsgDontSendFile
 		w.WriteHeader(200)
-		go QueueSong(SongHolder{ClientAddress(r), songName, string(sentHash), "", ""})
+		go QueueSong(SongHolder{
+			IpAddr:   ClientAddress(r),
+			Name:     songName,
+			Type:     RAWMP3,
+			FileHash: string(sentHash),
+			URL:      "",
+			Search:   "",
+		})
 	} else {
 		msg = MsgSendFullFile
 		w.WriteHeader(404)
@@ -157,14 +196,21 @@ func UploadFile(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(msg))
 		return
 	}
-	file, err := os.Create(DownloadFolder + "/" + cleanFileName + ".mp3")
+	file, err := os.Create(RawMp3Folder + "/" + cleanFileName + ".mp3")
 	utils.PanicIf(err)
 	defer file.Close()
 	_, err = file.Write(decodedRawData)
 	utils.PanicIf(err)
 	file.Sync()
 
-	QueueSong(SongHolder{ClientAddress(r), cleanFileName, string(hash[:]), "", ""})
+	QueueSong(SongHolder{
+		IpAddr:   ClientAddress(r),
+		Name:     cleanFileName,
+		Type:     RAWMP3,
+		FileHash: string(hash[:]),
+		URL:      "",
+		Search:   "",
+	})
 
 	w.WriteHeader(200)
 	w.Write([]byte(utils.ToJSON(MsgSongQueued)))
@@ -178,7 +224,7 @@ func GetQueue(w http.ResponseWriter, r *http.Request) {
 
 func QueueSong(song SongHolder) {
 	if song.FileHash != "" {
-		HashHolder[song.FileHash] = song.FileName
+		HashHolder[song.FileHash] = song.Name
 	}
 
 	_, userExists := SongQueue[song.IpAddr]
@@ -187,7 +233,7 @@ func QueueSong(song SongHolder) {
 	}
 
 	SongQueue[song.IpAddr].Songs = append(SongQueue[song.IpAddr].Songs, song)
-	log.Println(song.FileName + " successfully added to queue. (ip: " + song.IpAddr + ")")
+	log.Println(song.Name + " successfully added to queue. (ip: " + song.IpAddr + ")")
 	if !CurrentlyPlaying {
 		PlaySongs()
 	}
@@ -202,14 +248,28 @@ func PlaySongs() {
 		return
 	}
 	if nextSong.FileHash != "" {
-		log.Println("CURRENTLY PLAYING " + nextSong.FileName)
-		playSong := exec.Command("afplay", DownloadFolder+"/"+nextSong.FileName)
-		fmt.Println(DownloadFolder + "/" + nextSong.FileName)
-		err := playSong.Run()
+		log.Println("CURRENTLY PLAYING " + nextSong.Name)
+
+		var folder string
+		switch nextSong.Type {
+		case RAWMP3:
+			folder = RawMp3Folder
+		case YOUTUBE:
+			folder = YoutubeFolder
+		case SPOTIFY:
+			folder = SpotifyFolder
+		default:
+			panic(errors.New(fmt.Sprintf("%d is not a recognized song type.", nextSong.Type)))
+		}
+
+		songPlayer = exec.Command("mpg123", fmt.Sprintf("%s/%s.mp3", folder, nextSong.Name))
+		fmt.Println(fmt.Sprintf("%s/%s", folder, nextSong.Name))
+		err := songPlayer.Run()
 		if err != nil {
 			log.Println(err)
 		}
-		log.Println("DONE PLAYING " + nextSong.FileName)
+
+		log.Println("DONE PLAYING " + nextSong.Name)
 	}
 	PlaySongs()
 }
@@ -237,6 +297,32 @@ func PopQueue() (SongHolder, error) {
 	return SongHolder{}, ErrNoSongsLeft
 }
 
+func HandleInput() {
+
+	reader := bufio.NewReader(os.Stdin)
+	line := 0
+	for {
+		_, err := reader.ReadString('\n')
+		if err != nil && err == io.EOF {
+			break
+		}
+
+		songPlayer := exec.Command("echo", "asdf")
+		stdin, err := songPlayer.StdinPipe()
+		if err != nil {
+			fmt.Println(err)
+		}
+		defer stdin.Close()
+		io.WriteString(stdin, "4\n")
+		songPlayer.Wait()
+
+		// fmt.Println(input)
+		//io.WriteString(songPlayerInput, input)
+
+		line++
+	}
+}
+
 func ServerAddress() (string, error) {
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
@@ -254,7 +340,7 @@ func ServerAddress() (string, error) {
 }
 
 func ClientAddress(r *http.Request) string {
-	ipAddr := r.RemoteAddr[:len(r.RemoteAddr)-6]
+	ipAddr := r.RemoteAddr[:strings.LastIndex(r.RemoteAddr, ":")]
 	if ipAddr == "[::1]" {
 		ipAddr = "localhost"
 	}
