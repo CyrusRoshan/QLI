@@ -1,13 +1,11 @@
 package server
 
 import (
-	"bufio"
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"log"
 	"net"
@@ -26,8 +24,6 @@ import (
 )
 
 var (
-	songPlayer       *exec.Cmd
-	songPlayerInput  io.WriteCloser
 	CurrentlyPlaying = false
 	SongQueue        = make(map[string]*UserData)
 	HashHolder       = make(map[string]string)
@@ -37,9 +33,8 @@ var (
 	YoutubeFolder, _  = filepath.Abs("./serverSongs/youtube")
 	SpotifyFolder, _  = filepath.Abs("./serverSongs/spotify")
 
-	infoMsg    = color.New(color.FgYellow).Add(color.Bold)
-	errorMsg   = color.New(color.FgRed).Add(color.Bold)
-	successMsg = color.New(color.FgGreen).Add(color.Bold)
+	infoMsg  = color.New(color.FgYellow).Add(color.Bold)
+	musicMsg = color.New(color.FgBlue).Add(color.Bold)
 )
 
 const (
@@ -100,7 +95,6 @@ func StartServer(server ServerStruct) {
 	infoMsg.Println("Tell your friends to send requests to " + ipAddr + ":" + strconv.Itoa(*server.Port))
 
 	utils.PanicIf(err)
-	go HandleInput()
 
 	r := mux.NewRouter()
 	r.HandleFunc("/checkHash", CheckHash).
@@ -248,7 +242,7 @@ func PlaySongs() {
 		return
 	}
 	if nextSong.FileHash != "" {
-		log.Println("CURRENTLY PLAYING " + nextSong.Name)
+		musicMsg.Println("CURRENTLY PLAYING " + nextSong.Name)
 
 		var folder string
 		switch nextSong.Type {
@@ -262,9 +256,13 @@ func PlaySongs() {
 			panic(errors.New(fmt.Sprintf("%d is not a recognized song type.", nextSong.Type)))
 		}
 
-		songPlayer = exec.Command("mpg123", fmt.Sprintf("%s/%s.mp3", folder, nextSong.Name))
-		fmt.Println(fmt.Sprintf("%s/%s", folder, nextSong.Name))
-		err := songPlayer.Run()
+		color.Set(color.FgYellow)
+		songPlayer := exec.Command("mpg123", fmt.Sprintf("%s/%s.mp3", folder, nextSong.Name))
+		songPlayer.Stdout = os.Stdout
+		songPlayer.Stdin = os.Stdin
+		songPlayer.Stderr = os.Stderr
+		err = songPlayer.Run()
+		color.Unset()
 		if err != nil {
 			log.Println(err)
 		}
@@ -295,32 +293,6 @@ func PopQueue() (SongHolder, error) {
 		return PopQueue()
 	}
 	return SongHolder{}, ErrNoSongsLeft
-}
-
-func HandleInput() {
-
-	reader := bufio.NewReader(os.Stdin)
-	line := 0
-	for {
-		_, err := reader.ReadString('\n')
-		if err != nil && err == io.EOF {
-			break
-		}
-
-		songPlayer := exec.Command("echo", "asdf")
-		stdin, err := songPlayer.StdinPipe()
-		if err != nil {
-			fmt.Println(err)
-		}
-		defer stdin.Close()
-		io.WriteString(stdin, "4\n")
-		songPlayer.Wait()
-
-		// fmt.Println(input)
-		//io.WriteString(songPlayerInput, input)
-
-		line++
-	}
 }
 
 func ServerAddress() (string, error) {

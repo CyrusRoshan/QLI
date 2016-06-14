@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/cyrusroshan/qli/server"
@@ -72,7 +73,35 @@ func SendData(client ClientStruct, path string, jsonString string, fillResult in
 }
 
 func QueueURL(client ClientStruct) {
+	url := (*client.SongURL).String()
+	isYoutube, err := regexp.MatchString(`https:\/\/www\.youtube\.com\/watch\?v=.{11}`, url)
+	utils.PanicIf(err)
+	isSpotify, err := regexp.MatchString("spotify:track:.{22}", url)
+	utils.PanicIf(err)
 
+	if !isYoutube && !isSpotify {
+		fmt.Println("URL is not a valid youtube or spotify link, exiting.")
+		return
+	}
+
+	song := server.SongHolder{
+		IpAddr:   "",
+		Name:     "",
+		Type:     -1,
+		FileHash: "",
+		URL:      url,
+		Search:   "",
+	}
+	if isYoutube {
+		song.Type = server.YOUTUBE
+	} else if isSpotify {
+		song.Type = server.SPOTIFY
+	}
+
+	var uploadResponse string
+	songJSON := utils.ToJSON(song)
+	SendData(client, "queueURL", songJSON, &uploadResponse)
+	fmt.Println(uploadResponse)
 }
 
 func QueueSearch(client ClientStruct) {
