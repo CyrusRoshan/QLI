@@ -87,8 +87,6 @@ func StartServer(server ServerStruct) {
 	utils.MakeDirIfNotExist(SpotifyFolder)
 
 	HashExistingFiles(RawMp3Folder)
-	HashExistingFiles(YoutubeFolder)
-	HashExistingFiles(SpotifyFolder)
 
 	ipAddr, err := ServerAddress()
 	utils.PanicIf(err)
@@ -101,6 +99,9 @@ func StartServer(server ServerStruct) {
 		Methods("POST").
 		HeadersRegexp("Content-Type", "application/(text|json)")
 	r.HandleFunc("/uploadFile", UploadFile).
+		Methods("POST").
+		HeadersRegexp("Content-Type", "application/(text|json)")
+	r.HandleFunc("/queueURL", QueueURL).
 		Methods("POST").
 		HeadersRegexp("Content-Type", "application/(text|json)")
 	r.HandleFunc("/getQueue", GetQueue).
@@ -197,7 +198,7 @@ func UploadFile(w http.ResponseWriter, r *http.Request) {
 	utils.PanicIf(err)
 	file.Sync()
 
-	QueueSong(SongHolder{
+	go QueueSong(SongHolder{
 		IpAddr:   ClientAddress(r),
 		Name:     cleanFileName,
 		Type:     RAWMP3,
@@ -205,6 +206,33 @@ func UploadFile(w http.ResponseWriter, r *http.Request) {
 		URL:      "",
 		Search:   "",
 	})
+
+	w.WriteHeader(200)
+	w.Write([]byte(utils.ToJSON(MsgSongQueued)))
+}
+
+func QueueURL(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+
+	var song SongHolder
+	err := json.NewDecoder(r.Body).Decode(&song)
+	utils.PanicIf(err)
+
+	song.IpAddr = ClientAddress(r)
+
+	if song.Type == YOUTUBE {
+		song.Name = song.URL[len(song.URL)-11:]
+		if _, err := os.Stat(YoutubeFolder + "/" + song.Name + ".mp3"); os.IsNotExist(err) {
+			log.Println("DOWNLOADING", song.Name)
+			youtube := exec.Command("youtube-dl", "--extract-audio", "--audio-format=mp3", "--audio-quality=0", "--output="+YoutubeFolder+"/"+song.Name+".%(ext)s", song.URL)
+			err := youtube.Run()
+			utils.PanicIf(err)
+			log.Println("DOWNLOADED", song.Name)
+		} else {
+			log.Println("PREVIOUSLY DOWNLOADED, ADDING TO QUEUE", song.Name)
+		}
+		go QueueSong(song)
+	}
 
 	w.WriteHeader(200)
 	w.Write([]byte(utils.ToJSON(MsgSongQueued)))
@@ -241,34 +269,33 @@ func PlaySongs() {
 		CurrentlyPlaying = false
 		return
 	}
-	if nextSong.FileHash != "" {
-		musicMsg.Println("CURRENTLY PLAYING " + nextSong.Name)
 
-		var folder string
-		switch nextSong.Type {
-		case RAWMP3:
-			folder = RawMp3Folder
-		case YOUTUBE:
-			folder = YoutubeFolder
-		case SPOTIFY:
-			folder = SpotifyFolder
-		default:
-			panic(errors.New(fmt.Sprintf("%d is not a recognized song type.", nextSong.Type)))
-		}
+	musicMsg.Println("CURRENTLY PLAYING " + nextSong.Name)
 
-		color.Set(color.FgYellow)
-		songPlayer := exec.Command("mpg123", fmt.Sprintf("%s/%s.mp3", folder, nextSong.Name))
-		songPlayer.Stdout = os.Stdout
-		songPlayer.Stdin = os.Stdin
-		songPlayer.Stderr = os.Stderr
-		err = songPlayer.Run()
-		color.Unset()
-		if err != nil {
-			log.Println(err)
-		}
-
-		log.Println("DONE PLAYING " + nextSong.Name)
+	var folder string
+	switch nextSong.Type {
+	case RAWMP3:
+		folder = RawMp3Folder
+	case YOUTUBE:
+		folder = YoutubeFolder
+	case SPOTIFY:
+		folder = SpotifyFolder
+	default:
+		panic(errors.New(fmt.Sprintf("%d is not a recognized song type.", nextSong.Type)))
 	}
+
+	color.Set(color.FgYellow)
+	songPlayer := exec.Command("mpg123", fmt.Sprintf("%s/%s.mp3", folder, nextSong.Name))
+	songPlayer.Stdout = os.Stdout
+	songPlayer.Stdin = os.Stdin
+	songPlayer.Stderr = os.Stderr
+	err = songPlayer.Run()
+	color.Unset()
+	if err != nil {
+		log.Println(err)
+	}
+
+	log.Println("DONE PLAYING " + nextSong.Name)
 	PlaySongs()
 }
 

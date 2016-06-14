@@ -74,7 +74,7 @@ func SendData(client ClientStruct, path string, jsonString string, fillResult in
 
 func QueueURL(client ClientStruct) {
 	url := (*client.SongURL).String()
-	isYoutube, err := regexp.MatchString(`https:\/\/www\.youtube\.com\/watch\?v=.{11}`, url)
+	isYoutube, err := regexp.MatchString(`https?:\/\/www\.youtube\.com\/watch\?v=.{11}`, url)
 	utils.PanicIf(err)
 	isSpotify, err := regexp.MatchString("spotify:track:.{22}", url)
 	utils.PanicIf(err)
