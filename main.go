@@ -4,10 +4,10 @@ import (
 	"fmt"
 	"os"
 
+	"gopkg.in/alecthomas/kingpin.v2"
+
 	"github.com/cyrusroshan/qli/client"
 	"github.com/cyrusroshan/qli/server"
-
-	"gopkg.in/alecthomas/kingpin.v2"
 )
 
 func main() {
@@ -22,7 +22,7 @@ func main() {
 	clientSettings := client.ClientStruct{
 		ServerURL:  clientMode.Arg("server", "qli server IP address and port number.").Required().URL(),
 		SongFile:   clientMode.Flag("file", "Play an mp3 file on the server.").Short('f').File(),
-		SongURL:    clientMode.Flag("url", "Play music from a youtube or spotify url.").Short('u').URL(),
+		SongURL:    clientMode.Flag("url", "Play music from a youtube or spotify url.").Short('u').String(),
 		SongSearch: clientMode.Flag("search", "Search for a song on spotify and select one to be played.").Short('s').String(),
 	}
 
@@ -34,7 +34,7 @@ func main() {
 	case clientMode.FullCommand():
 		if *clientSettings.SongFile != nil {
 			client.QueueFile(clientSettings)
-		} else if *clientSettings.SongURL != nil {
+		} else if *clientSettings.SongURL != "" {
 			client.QueueURL(clientSettings)
 		} else if *clientSettings.SongSearch != "" {
 			client.QueueSearch(clientSettings)

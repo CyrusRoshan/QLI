@@ -20,7 +20,7 @@ import (
 type ClientStruct struct {
 	ServerURL  **url.URL
 	SongFile   **os.File
-	SongURL    **url.URL
+	SongURL    *string
 	SongSearch *string
 }
 
@@ -73,7 +73,7 @@ func SendData(client ClientStruct, path string, jsonString string, fillResult in
 }
 
 func QueueURL(client ClientStruct) {
-	url := (*client.SongURL).String()
+	url := *client.SongURL
 	isYoutube, err := regexp.MatchString(`https?:\/\/www\.youtube\.com\/watch\?v=.{11}`, url)
 	utils.PanicIf(err)
 	isSpotify, err := regexp.MatchString("spotify:track:.{22}", url)

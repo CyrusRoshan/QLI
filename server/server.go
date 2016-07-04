@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/json"
@@ -15,26 +16,38 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
-	"github.com/cyrusroshan/qli/utils"
+	"golang.org/x/crypto/ssh/terminal"
+
 	"github.com/fatih/color"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 	"github.com/kennygrant/sanitize"
+	"github.com/op/go-libspotify/spotify"
+
+	"github.com/cyrusroshan/qli/utils"
 )
 
 var (
-	CurrentlyPlaying = false
-	SongQueue        = make(map[string]*UserData)
-	HashHolder       = make(map[string]string)
+	CurrentlyPlaying          = false
+	SpotifyEnabled            = false
+	CurrentlyStreamingSpotify = false
+
+	SongQueue      = make(map[string]*UserData)
+	HashHolder     = make(map[string]string)
+	SpotifySession *spotify.Session
+	SpotifyAudio   spotify.AudioConsumer
 
 	DownloadFolder, _ = filepath.Abs("./serverSongs")
 	RawMp3Folder, _   = filepath.Abs("./serverSongs/rawmp3")
 	YoutubeFolder, _  = filepath.Abs("./serverSongs/youtube")
 	SpotifyFolder, _  = filepath.Abs("./serverSongs/spotify")
+	SpotifyKeyFile, _ = filepath.Abs("./keyFile/spotify.key")
 
-	infoMsg  = color.New(color.FgYellow).Add(color.Bold)
-	musicMsg = color.New(color.FgBlue).Add(color.Bold)
+	InfoMsg  = color.New(color.FgYellow).Add(color.Bold)
+	ErrorMsg = color.New(color.FgRed).Add(color.Bold)
+	MusicMsg = color.New(color.FgBlue).Add(color.Bold)
 )
 
 const (
@@ -79,6 +92,19 @@ type UserData struct {
 }
 
 func StartServer(server ServerStruct) {
+	if os.Getenv("GODEBUG") != "cgocheck=0" {
+		cmd := exec.Command(os.Args[0], os.Args[1:]...)
+		env := os.Environ()
+		env = append(env, "GODEBUG=cgocheck=0")
+		cmd.Env = env
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		err := cmd.Run()
+		fmt.Println(err)
+		os.Exit(0)
+	}
+
 	log.Println("Starting qli server")
 
 	utils.MakeDirIfNotExist(DownloadFolder)
@@ -86,13 +112,50 @@ func StartServer(server ServerStruct) {
 	utils.MakeDirIfNotExist(YoutubeFolder)
 	utils.MakeDirIfNotExist(SpotifyFolder)
 
+	spotifyKey, err := ioutil.ReadFile(SpotifyKeyFile)
+	utils.PanicIf(err)
+
+	SpotifySession, err = spotify.NewSession(&spotify.Config{
+		ApplicationKey:               spotifyKey,
+		ApplicationName:              "qli",
+		CacheLocation:                "tmp",
+		SettingsLocation:             "tmp",
+		AudioConsumer:                SpotifyAudio,
+		DisablePlaylistMetadataCache: true,
+		InitiallyUnloadPlaylists:     true,
+	})
+
+	reader := bufio.NewReader(os.Stdin)
+
+	fmt.Print("Spotify Username: ")
+	rawUser, err := reader.ReadString('\n')
+	utils.PanicIf(err)
+
+	fmt.Print("Spotify Password: ")
+	rawPass, err := terminal.ReadPassword(int(syscall.Stdin))
+	utils.PanicIf(err)
+	fmt.Println()
+
+	spotUser := strings.TrimSpace(rawUser)
+	spotPass := strings.TrimSpace(string(rawPass))
+
+	SpotifySession.Login(spotify.Credentials{Username: spotUser, Password: string(spotPass)}, false)
+	err = <-SpotifySession.LoggedInUpdates()
+	if err != nil {
+		ErrorMsg.Println("Spotify Credentials missing or invalid, continuing QLI server startup without Spotify support.")
+	} else {
+		InfoMsg.Println("Spotify support enabled.")
+		SpotifyEnabled = true
+	}
+
 	HashExistingFiles(RawMp3Folder)
 
 	ipAddr, err := ServerAddress()
-	utils.PanicIf(err)
-	infoMsg.Println("Tell your friends to send requests to " + ipAddr + ":" + strconv.Itoa(*server.Port))
-
-	utils.PanicIf(err)
+	if err != nil {
+		ipAddr = "localhost"
+		ErrorMsg.Println("Warning, you're not connected to a network, this will only work locally")
+	}
+	InfoMsg.Println("Tell your friends to send requests to " + ipAddr + ":" + strconv.Itoa(*server.Port))
 
 	r := mux.NewRouter()
 	r.HandleFunc("/checkHash", CheckHash).
@@ -223,19 +286,29 @@ func QueueURL(w http.ResponseWriter, r *http.Request) {
 	if song.Type == YOUTUBE {
 		song.Name = song.URL[len(song.URL)-11:]
 		if _, err := os.Stat(YoutubeFolder + "/" + song.Name + ".mp3"); os.IsNotExist(err) {
-			log.Println("DOWNLOADING", song.Name)
+			log.Println("Downloading youtube song", song.Name)
 			youtube := exec.Command("youtube-dl", "--extract-audio", "--audio-format=mp3", "--audio-quality=0", "--output="+YoutubeFolder+"/"+song.Name+".%(ext)s", song.URL)
 			err := youtube.Run()
 			utils.PanicIf(err)
-			log.Println("DOWNLOADED", song.Name)
+			log.Println("Finished downloading youtube song", song.Name)
 		} else {
-			log.Println("PREVIOUSLY DOWNLOADED, ADDING TO QUEUE", song.Name)
+			log.Println("Youtube song", song.Name, "already exists, adding to queue")
 		}
 		go QueueSong(song)
+	} else {
+		song.Name = song.URL
+		if !CurrentlyStreamingSpotify {
+			DownloadSpotify(song.Name)
+		}
 	}
 
 	w.WriteHeader(200)
 	w.Write([]byte(utils.ToJSON(MsgSongQueued)))
+}
+
+func DownloadSpotify(url string) {
+	log.Println("Downloading Spotify song", url)
+
 }
 
 func GetQueue(w http.ResponseWriter, r *http.Request) {
@@ -270,7 +343,7 @@ func PlaySongs() {
 		return
 	}
 
-	musicMsg.Println("CURRENTLY PLAYING " + nextSong.Name)
+	MusicMsg.Println("CURRENTLY PLAYING " + nextSong.Name)
 
 	var folder string
 	switch nextSong.Type {
